@@ -14,6 +14,7 @@ from tools import (
     create_project, get_projects, update_project, get_active_projects_summary,
     add_inbox, get_inbox, resolve_inbox,
     create_goal, get_goals, update_goal, link_goal_project, get_active_goals_summary,
+    get_schedule,
     get_summary_state, count_messages_since, get_messages_after,
     save_summary, get_latest_summary,
 )
@@ -311,6 +312,20 @@ TOOL_DEFINITIONS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_schedule",
+            "description": "Показать расписание: задачи с дедлайном и напоминания на период (сегодня/завтра/неделя/просрочено).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "period": {"type": "string", "enum": ["today", "tomorrow", "week", "overdue"],
+                               "description": "Период. По умолчанию 'today'."},
+                },
+            },
+        },
+    },
 ]
 
 TOOL_MAP = {
@@ -332,6 +347,7 @@ TOOL_MAP = {
     "get_goals":       get_goals,
     "update_goal":     update_goal,
     "link_goal_project": link_goal_project,
+    "get_schedule":    get_schedule,
 }
 
 

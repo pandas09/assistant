@@ -25,6 +25,7 @@ from tools import (
     get_due_reminders, mark_reminder_sent, clear_pinned_facts,
     get_inbox, resolve_inbox,
     get_goals,
+    get_schedule,
     PROFILE_KEYS,
 )
 from ctx import CURRENT_USER_ID
@@ -282,6 +283,28 @@ async def cmd_goals(message: Message):
     parts = message.text.split(maxsplit=1)
     status = parts[1].strip() if len(parts) > 1 else None
     await reply(message, await asyncio.to_thread(get_goals, status))
+
+
+@dp.message(Command("schedule", "today", "tomorrow"))
+@handler
+async def cmd_schedule(message: Message):
+    # /schedule [today|tomorrow|week|overdue]
+    # /today → today, /tomorrow → tomorrow (удобные псевдонимы)
+    parts = message.text.split(maxsplit=1)
+    if parts[0] in ("/today", "today"):
+        period = "today"
+    elif parts[0] in ("/tomorrow", "tomorrow"):
+        period = "tomorrow"
+    else:
+        period = parts[1].strip() if len(parts) > 1 else "today"
+    await reply(message, await asyncio.to_thread(get_schedule, period))
+
+
+@dp.message(Command("week"))
+@handler
+async def cmd_week_schedule(message: Message):
+    await reply(message, await asyncio.to_thread(get_schedule, "week"))
+
 
 def transcribe(path: str) -> str:
     with open(path, "rb") as audio:

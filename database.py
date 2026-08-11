@@ -147,6 +147,14 @@ def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # Расширение системы напоминаний: повторяющиеся (daily/weekly/monthly)
+        # и «через N часов/дней». repeat пустой = одноразовое напоминание.
+        for stmt in [
+            "ALTER TABLE reminders ADD COLUMN IF NOT EXISTS repeat   TEXT DEFAULT ''",
+            "ALTER TABLE reminders ADD COLUMN IF NOT EXISTS in_hours INTEGER",
+            "ALTER TABLE reminders ADD COLUMN IF NOT EXISTS in_days  INTEGER",
+        ]:
+            c.execute(stmt)
 
         c.execute("""
             CREATE TABLE IF NOT EXISTS pinned_facts (

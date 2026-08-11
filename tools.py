@@ -1,9 +1,9 @@
 import json
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 
-from config import TASKS_LIMIT
+from config import TASKS_LIMIT, now_local
 from constants import InboxStatus, InboxType
 from ctx import current_user_id
 from database import db
@@ -249,21 +249,55 @@ CANONICAL_DT = "%Y-%m-%d %H:%M"
 CANONICAL_RE = r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$"
 
 
-def create_reminder(title: str, remind_at: str) -> str:
-    when = parse_dt(remind_at)
-    if when is None:
-        return (
-            f"❌ Не понял время «{remind_at}». "
-            "Нужен формат YYYY-MM-DD HH:MM, например 2026-07-21 09:00."
-        )
-    stamp = when.strftime(CANONICAL_DT)  # normalise before storing, never raw LLM text
+def create_reminder(
+    title: str,
+    remind_at: str = None,
+    in_hours: int = None,
+    in_days: int = None,
+    repeat: str = "",
+) -> str:
+    """Создать напоминание.
+
+    Три способа задать время (приоритет сверху вниз):
+      1. remind_at — конкретная дата 'YYYY-MM-DD HH:MM'
+      2. in_hours / in_days — сдвиг от текущего момента (10 часов / 3 дня)
+      3. repeat — только повтор без явного времени: ставит на завтра в это же время
+    Если ни одного нет — ошибка.
+    """
+    if repeat and repeat not in ("daily", "weekly", "monthly"):
+        return f"❌ Повтор должен быть daily/weekly/monthly, получено {repeat!r}"
+
+    now = now_local()
+    when = None
+    if remind_at:
+        when = parse_dt(remind_at)
+        if when is None:
+            return (
+                f"❌ Не понял время «{remind_at}». "
+                "Нужен формат YYYY-MM-DD HH:MM, например 2026-07-21 09:00."
+            )
+    elif in_hours:
+        when = now + timedelta(hours=int(in_hours))
+    elif in_days:
+        when = now + timedelta(days=int(in_days))
+    elif repeat:
+        # только repeat без времени — ставим на завтра в то же время
+        when = now + timedelta(days=1)
+    else:
+        return "❌ Не указано время: задай remind_at, in_hours, in_days или repeat."
+
+    stamp = when.strftime(CANONICAL_DT)
     with db() as c:
         c.execute(
-            "INSERT INTO reminders (title, remind_at) VALUES (%s, %s) RETURNING id",
-            (title, stamp),
+            """INSERT INTO reminders (title, remind_at, repeat, in_hours, in_days)
+               VALUES (%s, %s, %s, %s, %s) RETURNING id""",
+            (title, stamp, repeat, in_hours, in_days),
         )
         rid = c.fetchone()["id"]
-    return f"⏰ [{rid}] {title} — {stamp}"
+    parts = [f"⏰ [{rid}] {title} — {stamp}"]
+    if repeat:
+        parts.append(f"🔁 повтор: {repeat}")
+    return " ".join(parts)
 
 
 def get_reminders() -> str:
@@ -296,6 +330,118 @@ def get_due_reminders(now: datetime) -> list:
 def mark_reminder_sent(reminder_id: int):
     with db() as c:
         c.execute("UPDATE reminders SET sent = 1 WHERE id = %s", (reminder_id,))
+
+
+# ─── Calendar / Schedule ───────────────────────────────────────────────────────
+# Читает tasks.deadline и reminders.remind_at, без внешней интеграции.
+# period: today | tomorrow | week | overdue
+
+_SCHEDULE_PERIODS = ("today", "tomorrow", "week", "overdue")
+_SCHEDULE_TASK_LIMIT = 15
+_SCHEDULE_REMINDER_LIMIT = 8
+
+
+def _day_bounds(day: datetime) -> tuple[str, str]:
+    """Канонические YYYY-MM-DD строки для фильтра по конкретному дню."""
+    start = day.strftime("%Y-%m-%d 00:00")
+    end = day.strftime("%Y-%m-%d 23:59")
+    return start, end
+
+
+def get_schedule(period: str = "today") -> str:
+    """Что по расписанию: задачи с дедлайном + напоминания на период."""
+    if period not in _SCHEDULE_PERIODS:
+        return f"❌ Неизвестный период: {period!r}. Доступно: {', '.join(_SCHEDULE_PERIODS)}"
+
+    now = now_local()
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    if period == "today":
+        day = today
+        period_label = "Сегодня"
+        task_filter = ("today", day)
+    elif period == "tomorrow":
+        day = today + timedelta(days=1)
+        period_label = "Завтра"
+        task_filter = ("today", day)
+    elif period == "week":
+        day = today + timedelta(days=7)
+        period_label = "Эта неделя"
+        task_filter = ("range", today, day)
+    else:  # overdue
+        period_label = "Просрочено"
+        task_filter = ("overdue", None)
+
+    # ── Задачи ────────────────────────────────────────────────────────────
+    tasks_lines = []
+    with db() as c:
+        if task_filter[0] == "today":
+            start, end = _day_bounds(task_filter[1])
+            c.execute(
+                """SELECT id, title, priority, deadline FROM tasks
+                   WHERE completed = 0 AND deadline IS NOT NULL
+                     AND deadline >= %s AND deadline <= %s
+                   ORDER BY deadline LIMIT %s""",
+                (start[:10], end[:10], _SCHEDULE_TASK_LIMIT),
+            )
+        elif task_filter[0] == "range":
+            c.execute(
+                """SELECT id, title, priority, deadline FROM tasks
+                   WHERE completed = 0 AND deadline IS NOT NULL
+                     AND deadline >= %s AND deadline <= %s
+                   ORDER BY deadline LIMIT %s""",
+                (today.strftime("%Y-%m-%d"), day.strftime("%Y-%m-%d"), _SCHEDULE_TASK_LIMIT),
+            )
+        else:  # overdue
+            c.execute(
+                """SELECT id, title, priority, deadline FROM tasks
+                   WHERE completed = 0 AND deadline IS NOT NULL
+                     AND deadline < %s
+                   ORDER BY deadline LIMIT %s""",
+                (today.strftime("%Y-%m-%d"), _SCHEDULE_TASK_LIMIT),
+            )
+        task_rows = c.fetchall()
+
+    if task_rows:
+        tasks_lines.append("📌 Задачи:")
+        for row in task_rows:
+            icon = PRIORITY_ICONS.get(row["priority"], "⚪")
+            dl = row["deadline"][:10] if row["deadline"] else ""
+            tasks_lines.append(f"   {icon} [{row['id']}] {row['title']} — {dl}")
+    else:
+        tasks_lines.append(f"📌 Задач: нет")
+
+    # ── Напоминания (не повторяющиеся) ────────────────────────────────────
+    rem_lines = []
+    if period in ("today", "tomorrow", "week"):
+        with db() as c:
+            if period in ("today", "tomorrow"):
+                start, end = _day_bounds(day)
+                c.execute(
+                    "SELECT id, title, remind_at FROM reminders "
+                    "WHERE sent = 0 AND remind_at >= %s AND remind_at <= %s "
+                    "ORDER BY remind_at LIMIT %s",
+                    (start, end, _SCHEDULE_REMINDER_LIMIT),
+                )
+            else:  # week
+                c.execute(
+                    "SELECT id, title, remind_at FROM reminders "
+                    "WHERE sent = 0 AND remind_at >= %s AND remind_at <= %s "
+                    "ORDER BY remind_at LIMIT %s",
+                    (now.strftime(CANONICAL_DT), (today + timedelta(days=7)).strftime(CANONICAL_DT),
+                     _SCHEDULE_REMINDER_LIMIT),
+                )
+            rem_rows = c.fetchall()
+        if rem_rows:
+            rem_lines.append("⏰ Напоминания:")
+            for row in rem_rows:
+                stamp = str(row["remind_at"])[5:16]  # MM-DD HH:MM
+                rem_lines.append(f"   [{row['id']}] {row['title']} — {stamp}")
+        else:
+            rem_lines.append("⏰ Напоминаний: нет")
+
+    body = "\n".join(tasks_lines + [""] + rem_lines)
+    return f"📅 {period_label}:\n\n{body}"
 
 
 # ─── Universal Inbox ───────────────────────────────────────────────────────────
