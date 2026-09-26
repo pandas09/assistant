@@ -1,8 +1,11 @@
+import json
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 
-from config import TASKS_LIMIT
+from config import TASKS_LIMIT, now_local
+from constants import InboxStatus, InboxType
+from ctx import current_user_id
 from database import db
 
 logger = logging.getLogger(__name__)
@@ -246,21 +249,55 @@ CANONICAL_DT = "%Y-%m-%d %H:%M"
 CANONICAL_RE = r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$"
 
 
-def create_reminder(title: str, remind_at: str) -> str:
-    when = parse_dt(remind_at)
-    if when is None:
-        return (
-            f"❌ Не понял время «{remind_at}». "
-            "Нужен формат YYYY-MM-DD HH:MM, например 2026-07-21 09:00."
-        )
-    stamp = when.strftime(CANONICAL_DT)  # normalise before storing, never raw LLM text
+def create_reminder(
+    title: str,
+    remind_at: str = None,
+    in_hours: int = None,
+    in_days: int = None,
+    repeat: str = "",
+) -> str:
+    """Создать напоминание.
+
+    Три способа задать время (приоритет сверху вниз):
+      1. remind_at — конкретная дата 'YYYY-MM-DD HH:MM'
+      2. in_hours / in_days — сдвиг от текущего момента (10 часов / 3 дня)
+      3. repeat — только повтор без явного времени: ставит на завтра в это же время
+    Если ни одного нет — ошибка.
+    """
+    if repeat and repeat not in ("daily", "weekly", "monthly"):
+        return f"❌ Повтор должен быть daily/weekly/monthly, получено {repeat!r}"
+
+    now = now_local()
+    when = None
+    if remind_at:
+        when = parse_dt(remind_at)
+        if when is None:
+            return (
+                f"❌ Не понял время «{remind_at}». "
+                "Нужен формат YYYY-MM-DD HH:MM, например 2026-07-21 09:00."
+            )
+    elif in_hours:
+        when = now + timedelta(hours=int(in_hours))
+    elif in_days:
+        when = now + timedelta(days=int(in_days))
+    elif repeat:
+        # только repeat без времени — ставим на завтра в то же время
+        when = now + timedelta(days=1)
+    else:
+        return "❌ Не указано время: задай remind_at, in_hours, in_days или repeat."
+
+    stamp = when.strftime(CANONICAL_DT)
     with db() as c:
         c.execute(
-            "INSERT INTO reminders (title, remind_at) VALUES (%s, %s) RETURNING id",
-            (title, stamp),
+            """INSERT INTO reminders (title, remind_at, repeat, in_hours, in_days)
+               VALUES (%s, %s, %s, %s, %s) RETURNING id""",
+            (title, stamp, repeat, in_hours, in_days),
         )
         rid = c.fetchone()["id"]
-    return f"⏰ [{rid}] {title} — {stamp}"
+    parts = [f"⏰ [{rid}] {title} — {stamp}"]
+    if repeat:
+        parts.append(f"🔁 повтор: {repeat}")
+    return " ".join(parts)
 
 
 def get_reminders() -> str:
@@ -293,6 +330,426 @@ def get_due_reminders(now: datetime) -> list:
 def mark_reminder_sent(reminder_id: int):
     with db() as c:
         c.execute("UPDATE reminders SET sent = 1 WHERE id = %s", (reminder_id,))
+
+
+# ─── Calendar / Schedule ───────────────────────────────────────────────────────
+# Читает tasks.deadline и reminders.remind_at, без внешней интеграции.
+# period: today | tomorrow | week | overdue
+
+_SCHEDULE_PERIODS = ("today", "tomorrow", "week", "overdue")
+_SCHEDULE_TASK_LIMIT = 15
+_SCHEDULE_REMINDER_LIMIT = 8
+
+
+def _day_bounds(day: datetime) -> tuple[str, str]:
+    """Канонические YYYY-MM-DD строки для фильтра по конкретному дню."""
+    start = day.strftime("%Y-%m-%d 00:00")
+    end = day.strftime("%Y-%m-%d 23:59")
+    return start, end
+
+
+def get_schedule(period: str = "today") -> str:
+    """Что по расписанию: задачи с дедлайном + напоминания на период."""
+    if period not in _SCHEDULE_PERIODS:
+        return f"❌ Неизвестный период: {period!r}. Доступно: {', '.join(_SCHEDULE_PERIODS)}"
+
+    now = now_local()
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    if period == "today":
+        day = today
+        period_label = "Сегодня"
+        task_filter = ("today", day)
+    elif period == "tomorrow":
+        day = today + timedelta(days=1)
+        period_label = "Завтра"
+        task_filter = ("today", day)
+    elif period == "week":
+        day = today + timedelta(days=7)
+        period_label = "Эта неделя"
+        task_filter = ("range", today, day)
+    else:  # overdue
+        period_label = "Просрочено"
+        task_filter = ("overdue", None)
+
+    # ── Задачи ────────────────────────────────────────────────────────────
+    tasks_lines = []
+    with db() as c:
+        if task_filter[0] == "today":
+            start, end = _day_bounds(task_filter[1])
+            c.execute(
+                """SELECT id, title, priority, deadline FROM tasks
+                   WHERE completed = 0 AND deadline IS NOT NULL
+                     AND deadline >= %s AND deadline <= %s
+                   ORDER BY deadline LIMIT %s""",
+                (start[:10], end[:10], _SCHEDULE_TASK_LIMIT),
+            )
+        elif task_filter[0] == "range":
+            c.execute(
+                """SELECT id, title, priority, deadline FROM tasks
+                   WHERE completed = 0 AND deadline IS NOT NULL
+                     AND deadline >= %s AND deadline <= %s
+                   ORDER BY deadline LIMIT %s""",
+                (today.strftime("%Y-%m-%d"), day.strftime("%Y-%m-%d"), _SCHEDULE_TASK_LIMIT),
+            )
+        else:  # overdue
+            c.execute(
+                """SELECT id, title, priority, deadline FROM tasks
+                   WHERE completed = 0 AND deadline IS NOT NULL
+                     AND deadline < %s
+                   ORDER BY deadline LIMIT %s""",
+                (today.strftime("%Y-%m-%d"), _SCHEDULE_TASK_LIMIT),
+            )
+        task_rows = c.fetchall()
+
+    if task_rows:
+        tasks_lines.append("📌 Задачи:")
+        for row in task_rows:
+            icon = PRIORITY_ICONS.get(row["priority"], "⚪")
+            dl = row["deadline"][:10] if row["deadline"] else ""
+            tasks_lines.append(f"   {icon} [{row['id']}] {row['title']} — {dl}")
+    else:
+        tasks_lines.append(f"📌 Задач: нет")
+
+    # ── Напоминания (не повторяющиеся) ────────────────────────────────────
+    rem_lines = []
+    if period in ("today", "tomorrow", "week"):
+        with db() as c:
+            if period in ("today", "tomorrow"):
+                start, end = _day_bounds(day)
+                c.execute(
+                    "SELECT id, title, remind_at FROM reminders "
+                    "WHERE sent = 0 AND remind_at >= %s AND remind_at <= %s "
+                    "ORDER BY remind_at LIMIT %s",
+                    (start, end, _SCHEDULE_REMINDER_LIMIT),
+                )
+            else:  # week
+                c.execute(
+                    "SELECT id, title, remind_at FROM reminders "
+                    "WHERE sent = 0 AND remind_at >= %s AND remind_at <= %s "
+                    "ORDER BY remind_at LIMIT %s",
+                    (now.strftime(CANONICAL_DT), (today + timedelta(days=7)).strftime(CANONICAL_DT),
+                     _SCHEDULE_REMINDER_LIMIT),
+                )
+            rem_rows = c.fetchall()
+        if rem_rows:
+            rem_lines.append("⏰ Напоминания:")
+            for row in rem_rows:
+                stamp = str(row["remind_at"])[5:16]  # MM-DD HH:MM
+                rem_lines.append(f"   [{row['id']}] {row['title']} — {stamp}")
+        else:
+            rem_lines.append("⏰ Напоминаний: нет")
+
+    body = "\n".join(tasks_lines + [""] + rem_lines)
+    return f"📅 {period_label}:\n\n{body}"
+
+
+# ─── Universal Inbox ───────────────────────────────────────────────────────────
+# Страховочная сетка: сюда падает только то, что LLM не смог уверенно отнести
+# к задаче/заметке/расходу/здоровью. Основной путь — прямое создание в нужном
+# модуле (правило в системном промпте). Inbox — fallback, не «главная папка».
+
+INBOX_LIMIT = 20  # верхняя граница выдачи /inbox (читаемость и токены)
+
+_TYPE_ICONS = {
+    InboxType.TEXT: "💬",
+    InboxType.VOICE: "🎤",
+    InboxType.IMAGE: "🖼",
+    InboxType.DOCUMENT: "📎",
+    InboxType.FORWARD: "↪️",
+}
+_STATUS_ICONS = {
+    InboxStatus.INBOX: "📥",
+    InboxStatus.TASK: "✅→задача",
+    InboxStatus.NOTE: "✅→заметка",
+    InboxStatus.EXPENSE: "✅→расход",
+    InboxStatus.HEALTH: "✅→здоровье",
+    InboxStatus.DONE: "✔️ закрыто",
+}
+
+
+def add_inbox(content: str, type: str = InboxType.TEXT, metadata: dict = None) -> str:
+    """Бросить запись в Inbox. user_id берётся из контекста, не из аргументов.
+
+    metadata — произвольный JSONB (file_id, duration, mime, photo…). Если
+    передан не-словарь — сохраняем как '{}', лучше пустой JSON, чем упавший INSERT.
+    """
+    if type not in InboxType.ALL:
+        return f"❌ Неизвестный тип inbox: {type!r}"
+    meta_str = json.dumps(metadata, ensure_ascii=False) if isinstance(metadata, dict) else "{}"
+    uid = current_user_id()
+    with db() as c:
+        c.execute(
+            """INSERT INTO inbox (user_id, type, content, metadata)
+               VALUES (%s, %s, %s, %s::jsonb) RETURNING id""",
+            (uid, type, content, meta_str),
+        )
+        iid = c.fetchone()["id"]
+    icon = _TYPE_ICONS.get(type, "📥")
+    return f"{icon} В Inbox [{iid}]: {content}"
+
+
+def get_inbox(status: str = InboxStatus.INBOX) -> str:
+    """Показать записи Inbox. По умолчанию — нераспределённые (status=inbox)."""
+    if status not in InboxStatus.ALL:
+        return f"❌ Неизвестный статус inbox: {status!r}"
+    uid = current_user_id()
+    with db() as c:
+        c.execute(
+            "SELECT id, type, content, metadata, status, created_at "
+            "FROM inbox WHERE user_id = %s AND status = %s "
+            "ORDER BY created_at DESC LIMIT %s",
+            (uid, status, INBOX_LIMIT + 1),
+        )
+        rows = c.fetchall()
+    if not rows:
+        label = "нераспределённые" if status == InboxStatus.INBOX else f"со статусом «{status}»"
+        return f"📥 В Inbox {label} записи отсутствуют."
+    truncated = len(rows) > INBOX_LIMIT
+    rows = rows[:INBOX_LIMIT]
+
+    header = "📥" if status == InboxStatus.INBOX else f"📥 (статус: {status})"
+    lines = [f"{header} Inbox:\n"]
+    for row in rows:
+        icon = _TYPE_ICONS.get(row["type"], "📥")
+        preview = row["content"][:140] + ("…" if len(row["content"]) > 140 else "")
+        date_str = str(row["created_at"])[:10]
+        lines.append(f"{icon} [{row['id']}] {preview}\n   {date_str}")
+    if truncated:
+        lines.append(f"\n… показаны первые {INBOX_LIMIT}.")
+    return "\n".join(lines)
+
+
+def resolve_inbox(item_id: int, action: str = InboxStatus.DONE) -> str:
+    """Отметить запись Inbox как обработанную (статус task/note/done/...).
+
+    Сама запись НЕ создаёт задачу/заметку elsewhere — это лишь отметка, что
+    пользователь вручную разобрал запись. Прямое создание делает LLM через
+    create_task/save_note/..., а сюда запись попадает если уже создана.
+    """
+    if action not in InboxStatus.ALL:
+        return f"❌ Неизвестное действие: {action!r}"
+    uid = current_user_id()
+    with db() as c:
+        c.execute(
+            "UPDATE inbox SET status = %s WHERE id = %s AND user_id = %s RETURNING content",
+            (action, item_id, uid),
+        )
+        row = c.fetchone()
+    if not row:
+        return f"❌ Запись [{item_id}] не найдена в твоём Inbox."
+    label = _STATUS_ICONS.get(action, action)
+    return f"{label}: «{row['content'][:80]}»"
+
+
+def get_inbox_count() -> int:
+    """Сколько нераспределённых записей в Inbox текущего пользователя.
+    Для Dashboard — число, а не строка."""
+    uid = current_user_id()
+    with db() as c:
+        c.execute(
+            "SELECT COUNT(*) AS n FROM inbox WHERE user_id = %s AND status = 'inbox'",
+            (uid,),
+        )
+        return c.fetchone()["n"]
+
+
+# ─── Goals ─────────────────────────────────────────────────────────────────────
+
+GOALS_LIMIT = 25
+GOAL_STATUS_ICONS = {"active": "🎯", "done": "✅", "paused": "⏸"}
+GOAL_PRIORITY_ICONS = {"high": "🔴", "medium": "🟡", "low": "🟢"}
+_PRIORITY_ORDER = {"high": 1, "medium": 2, "low": 3}
+
+
+def create_goal(
+    title: str,
+    description: str = "",
+    deadline: str = None,
+    priority: str = "medium",
+    kpi: str = "",
+) -> str:
+    """Создать цель. priority/status имеют дефолты, чтобы LLM мог вызвать с минимумом."""
+    if priority not in ("high", "medium", "low"):
+        return f"❌ Неизвестный приоритет: {priority!r}"
+    uid = current_user_id()
+    with db() as c:
+        c.execute(
+            """INSERT INTO goals (user_id, title, description, deadline, priority, kpi)
+               VALUES (%s, %s, %s, %s, %s, %s) RETURNING id""",
+            (uid, title, description, deadline, priority, kpi),
+        )
+        gid = c.fetchone()["id"]
+    p_icon = GOAL_PRIORITY_ICONS.get(priority, "⚪")
+    dl = f" (до {deadline})" if deadline else ""
+    return f"🎯 Цель [{gid}] {p_icon} {title}{dl}"
+
+
+def get_goals(status_filter: str = None) -> str:
+    """Показать цели. По умолчанию — активные, отсортированы по приоритету."""
+    if status_filter and status_filter not in ("active", "done", "paused"):
+        return f"❌ Неизвестный статус: {status_filter!r}"
+    uid = current_user_id()
+    with db() as c:
+        if status_filter:
+            c.execute(
+                """SELECT id, title, description, deadline, status, priority, kpi, progress,
+                          created_at
+                   FROM goals WHERE user_id = %s AND status = %s
+                   ORDER BY CASE priority WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,
+                            created_at LIMIT %s""",
+                (uid, status_filter, GOALS_LIMIT + 1),
+            )
+        else:
+            # без фильтра — только активные (архив done/paused по запросу)
+            c.execute(
+                """SELECT id, title, description, deadline, status, priority, kpi, progress,
+                          created_at
+                   FROM goals WHERE user_id = %s AND status = 'active'
+                   ORDER BY CASE priority WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,
+                            created_at LIMIT %s""",
+                (uid, GOALS_LIMIT + 1),
+            )
+        rows = c.fetchall()
+    if not rows:
+        return "🎯 Активных целей нет"
+    truncated = len(rows) > GOALS_LIMIT
+    rows = rows[:GOALS_LIMIT]
+
+    # Подгружаем связанные проекты одним запросом
+    gids = [r["id"] for r in rows]
+    proj_map: dict[int, list[str]] = {}
+    if gids:
+        with db() as c:
+            c.execute(
+                """SELECT gp.goal_id, p.name
+                   FROM goal_projects gp JOIN projects p ON p.id = gp.project_id
+                   WHERE gp.goal_id = ANY(%s)""",
+                (gids,),
+            )
+            for row in c.fetchall():
+                proj_map.setdefault(row["goal_id"], []).append(row["name"])
+
+    header = "🎯 Цели:" if not status_filter else f"🎯 Цели ({status_filter}):"
+    lines = [header + "\n"]
+    for r in rows:
+        p_icon = GOAL_PRIORITY_ICONS.get(r["priority"], "⚪")
+        bar = _progress_bar(r["progress"])
+        dl = f" — до {r['deadline']}" if r["deadline"] else ""
+        lines.append(f"{p_icon} [{r['id']}] {r['title']}{dl} {bar}")
+        if r["kpi"]:
+            lines.append(f"   📊 KPI: {r['kpi']}")
+        if r["description"]:
+            preview = r["description"][:120] + ("…" if len(r["description"]) > 120 else "")
+            lines.append(f"   {preview}")
+        if r["id"] in proj_map:
+            lines.append(f"   🔗 Проекты: {', '.join(proj_map[r['id']])}")
+    if truncated:
+        lines.append(f"\n… показаны первые {GOALS_LIMIT}.")
+    return "\n".join(lines)
+
+
+def update_goal(
+    goal_id: int,
+    status: str = None,
+    priority: str = None,
+    progress: int = None,
+    kpi: str = None,
+    description: str = None,
+    deadline: str = None,
+) -> str:
+    """Обновить поля цели. progress 0-100; при status='done' progress=100 автоматически."""
+    if status and status not in ("active", "done", "paused"):
+        return f"❌ Неизвестный статус: {status!r}"
+    if priority and priority not in ("high", "medium", "low"):
+        return f"❌ Неизвестный приоритет: {priority!r}"
+    if progress is not None and not (0 <= progress <= 100):
+        return f"❌ Прогресс должен быть 0-100, получено {progress}"
+
+    uid = current_user_id()
+    updates, values = [], []
+    if status is not None:
+        updates.append("status = %s")
+        values.append(status)
+        if status == "done":
+            updates.append("progress = 100")
+    if priority is not None:
+        updates.append("priority = %s")
+        values.append(priority)
+    if progress is not None:
+        updates.append("progress = %s")
+        values.append(progress)
+    if kpi is not None:
+        updates.append("kpi = %s")
+        values.append(kpi)
+    if description is not None:
+        updates.append("description = %s")
+        values.append(description)
+    if deadline is not None:
+        updates.append("deadline = %s")
+        values.append(deadline)
+    if not updates:
+        return "❌ Нечего обновлять"
+
+    values += [goal_id, uid]
+    with db() as c:
+        c.execute(
+            f"UPDATE goals SET {', '.join(updates)} WHERE id = %s AND user_id = %s RETURNING title",
+            values,
+        )
+        row = c.fetchone()
+    if not row:
+        return f"❌ Цель [{goal_id}] не найдена"
+    return f"✅ Цель [{goal_id}] обновлена"
+
+
+def link_goal_project(goal_id: int, project_id: int) -> str:
+    """Связать цель с проектом (многие-ко-многим). Оба id валидируются."""
+    uid = current_user_id()
+    with db() as c:
+        # Цель — у текущего пользователя
+        c.execute("SELECT 1 FROM goals WHERE id = %s AND user_id = %s", (goal_id, uid))
+        if c.fetchone() is None:
+            return f"❌ Цель [{goal_id}] не найдена"
+        # Проект — глобальный (в projects нет user_id по решению Phase 1.0)
+        c.execute("SELECT name FROM projects WHERE id = %s", (project_id,))
+        prow = c.fetchone()
+        if prow is None:
+            return f"❌ Проект [{project_id}] не найден"
+        c.execute(
+            "INSERT INTO goal_projects (goal_id, project_id) VALUES (%s, %s) "
+            "ON CONFLICT (goal_id, project_id) DO NOTHING",
+            (goal_id, project_id),
+        )
+    return f"🔗 Цель [{goal_id}] ↔ проект «{prow['name']}»"
+
+
+def get_active_goals_summary() -> str:
+    """Краткий блок для системного промпта (одна строка на цель, как с проектами)."""
+    uid = current_user_id()
+    with db() as c:
+        c.execute(
+            """SELECT id, title, priority, progress
+               FROM goals WHERE user_id = %s AND status = 'active'
+               ORDER BY CASE priority WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,
+                        created_at LIMIT 10""",
+            (uid,),
+        )
+        rows = c.fetchall()
+    if not rows:
+        return ""
+    icons = {"high": "🔴", "medium": "🟡", "low": "🟢"}
+    lines = []
+    for r in rows:
+        icon = icons.get(r["priority"], "•")
+        lines.append(f"{icon} [{r['id']}] {r['title']} ({r['progress']}%)")
+    return "\n".join(lines)
+
+
+def _progress_bar(progress: int) -> str:
+    """10-сегментный текстовый прогресс-бар: ▰▰▰▰▱▱▱▱▱▱"""
+    filled = max(0, min(10, round(progress / 10)))
+    return "▰" * filled + "▱" * (10 - filled) + f" {progress}%"
 
 
 # ─── Pinned facts ──────────────────────────────────────────────────────────────

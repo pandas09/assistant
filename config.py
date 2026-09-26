@@ -56,9 +56,10 @@ def now_local() -> datetime:
 
 # groq/compound удалён — не поддерживает tool calling
 MODELS = [
-    "llama-3.3-70b-versatile",  # Primary: надёжный tool calling
-    "llama-3.1-8b-instant",     # Fallback, он же быстрый для служебных задач
+    "openai/gpt-oss-120b",  # Primary: общение, аналитика, код
+    "openai/gpt-oss-20b",   # Fallback: быстрый и дешёвый
 ]
+
 FAST_MODEL = MODELS[-1]
 
 WHISPER_MODEL    = "whisper-large-v3-turbo"
